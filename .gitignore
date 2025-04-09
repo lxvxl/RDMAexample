@@ -1,2 +1,13 @@
-build
-*.pcap
+# 忽略所有文件
+*
+
+# 但保留 .cc 和 .h 文件
+!*.cc
+!*.h
+
+# 保留 Makefile（区分大小写）
+!Makefile
+!.gitignore
+
+# 如果有子目录，保留目录结构（必要）
+!*/
