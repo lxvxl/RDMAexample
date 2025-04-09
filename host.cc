@@ -20,7 +20,7 @@
 
 
 #define MAX_POLL_CQ_TIMEOUT 2000
-#define MSG_SIZE 65565
+#define MSG_SIZE 3000
 
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 static inline uint64_t htonll(uint64_t x) {
@@ -196,7 +196,7 @@ int Host::poll_completion() {
     } else if(poll_result == 0) {
         /* the CQ is empty */
         //fprintf(stderr, "completion wasn't found in the CQ after timeout\n");
-        rc = 1;
+        rc = 2;
     } else {
         /* CQE found */
         //fprintf(stdout, "completion was found in CQ with status 0x%x\n", wc.status);
@@ -204,7 +204,7 @@ int Host::poll_completion() {
         if(wc.status != IBV_WC_SUCCESS) {
             fprintf(stderr, "got bad completion with status: 0x%x, vendor syndrome: 0x%x\n", 
                     wc.status, wc.vendor_err);
-            rc = 1;
+            rc = 3;
         }
     }
     return rc;
@@ -475,7 +475,7 @@ int Host::connect_qp() {
     if(config.gid_idx >= 0) {
         GOTO_ERR_IF_NONZERO(ibv_query_gid(res.ib_ctx, config.ib_port, config.gid_idx, &my_gid), connect_qp_exit);
     } else {
-        memset(&my_gid, 0, sizeof my_gid);
+        memset(&my_gid, 0, sizeof(my_gid));
     }
 
     /* exchange using TCP sockets info required to connect QPs */
@@ -576,22 +576,26 @@ init_error:
 void Host::run() {
     char temp_buf[10];
     GOTO_ERR_IF_NONZERO(init(), host_run_exit);
-    printf("[%d]Successfully established RDMA connection\n", config.tcp_port);
+    printf("[%d]Successfully established RDMA connection! This is %s\n", config.tcp_port, isSender ? "Sender" : "Receiver");
     while (true) {
         if (isSender) {
-            //GOTO_ERR_IF_NONZERO(sock_sync_data(1, sync_str, temp_buf), host_run_exit);
             GOTO_ERR_IF_NONZERO(post_send(IBV_WR_RDMA_WRITE), host_run_exit);
             GOTO_ERR_IF_NONZERO(poll_completion(), host_run_exit);
+            GOTO_ERR_IF_NONZERO(sock_sync_data(1, sync_str, temp_buf), host_run_exit);
+            printf("[%d] successfully send data\n", config.tcp_port);
             std::this_thread::sleep_for(std::chrono::milliseconds(std::rand() % 97));
         } else {
-            // GOTO_ERR_IF_NONZERO(post_receive(), host_run_exit);
-            // GOTO_ERR_IF_NONZERO(sock_sync_data(1, sync_str, temp_buf), host_run_exit);
-            // GOTO_ERR_IF_NONZERO(poll_completion(), host_run_exit);
+            //GOTO_ERR_IF_NONZERO(post_receive(), host_run_exit);
+            GOTO_ERR_IF_NONZERO(sock_sync_data(1, sync_str, temp_buf), host_run_exit);
+            //GOTO_ERR_IF_NONZERO(poll_completion(), host_run_exit);
+            printf("[%d] successfully receive data\n", config.tcp_port);
         }
+        break; //暂时只发送一次
     }
+    printf("[%d] successfully finish the task\n", config.tcp_port);
+    return;
 host_run_exit:
     printf("[%d] has error when running, destroying resources...\n", config.tcp_port);
-    resources_destroy();
 }
 
 void Host::run_in_thread() {
