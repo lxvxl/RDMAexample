@@ -35,6 +35,9 @@ run: all
 		./$(TARGET); \
 	fi
 
+capture:
+	sudo tcpdump -i mlx5_0 -w capture.pcap
+
 # 清理生成的文件
 clean:
 	rm -f $(OBJS) $(TARGET)
