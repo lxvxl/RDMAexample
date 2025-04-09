@@ -17,7 +17,8 @@
 #include <netdb.h>
 #include <thread>
 #include <random>
-
+#include <ctime>
+#include <cstring>
 
 #define MAX_POLL_CQ_TIMEOUT 2000
 #define MSG_SIZE 3000
@@ -218,6 +219,11 @@ int Host::post_send(int opcode) {
     /* prepare the scatter/gather entry */
     memset(&sge, 0, sizeof(sge));
     sge.addr = (uintptr_t)res.buf;
+
+    std::time_t now = std::time(nullptr);
+    std::tm* localTime = std::localtime(&now);
+    std::strftime(res.buf, MSG_SIZE, "%Y-%m-%d %H:%M:%S", localTime);
+
     sge.length = MSG_SIZE;
     sge.lkey = res.mr->lkey;
 
@@ -588,7 +594,7 @@ void Host::run() {
             //GOTO_ERR_IF_NONZERO(post_receive(), host_run_exit);
             GOTO_ERR_IF_NONZERO(sock_sync_data(1, sync_str, temp_buf), host_run_exit);
             //GOTO_ERR_IF_NONZERO(poll_completion(), host_run_exit);
-            printf("[%d] successfully receive data\n", config.tcp_port);
+            printf("[%d] successfully receive data: %s\n", config.tcp_port, res.buf);
         }
         break; //暂时只发送一次
     }
