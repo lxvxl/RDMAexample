@@ -1,7 +1,19 @@
 # 编译器
 CXX = g++
 # 编译选项
-CXXFLAGS = -Wall -O2 -std=c++11
+# - 默认是 release（-O2）
+# - 调试：make DEBUG=1（-O0 -g3，并尽量保留栈帧/源码可单步）
+DEBUG ?= 0
+
+CXXFLAGS_COMMON = -Wall -std=c++11
+CXXFLAGS_RELEASE = -O2
+CXXFLAGS_DEBUG = -O0 -g3 -ggdb3 -fno-omit-frame-pointer -fno-inline -fno-optimize-sibling-calls
+
+ifeq ($(DEBUG),1)
+	CXXFLAGS = $(CXXFLAGS_COMMON) $(CXXFLAGS_DEBUG)
+else
+	CXXFLAGS = $(CXXFLAGS_COMMON) $(CXXFLAGS_RELEASE)
+endif
 # 链接库
 LIBS = -libverbs
 
@@ -15,6 +27,10 @@ TARGET = Simulator
 # 默认目标
 all: build $(TARGET)
 
+# 调试构建（等价于 make DEBUG=1）
+debug:
+	$(MAKE) DEBUG=1 all
+
 # 创建 build 目录
 build:
 	mkdir -p build
@@ -27,12 +43,25 @@ $(TARGET): $(OBJS)
 build/%.o: %.cc | build
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+# 运行选项（可通过 make 命令行覆盖）
+# 示例: make run N=2 F=3
+N  ?= 1   # 模拟的 Host 数量
+F  ?= 1   # 每个 Host 的流数量
+
 # 运行目标：构建并运行
 run: all
-	@if ifconfig | grep -q "192.168.201.4"; then \
-		./$(TARGET) 192.168.201.3; \
+	@if ifconfig | grep -q "192.168.5.122"; then \
+		./$(TARGET) -n $(N) -f $(F) 192.168.5.123; \
 	else \
-		./$(TARGET); \
+		./NotifyReceive.sh N=$(N) F=$(F) > output.txt 2>&1 & \
+		./$(TARGET) -n $(N) -f $(F); \
+	fi
+
+lrun: all
+	@if ifconfig | grep -q "192.168.5.122"; then \
+		ltrace -f -S -tt -o ltrace.log ./$(TARGET) -n $(N) -f $(F) 192.168.5.123; \
+	else \
+		ltrace -f -S -tt -o ltrace.log ./$(TARGET) -n $(N) -f $(F); \
 	fi
 
 capture:

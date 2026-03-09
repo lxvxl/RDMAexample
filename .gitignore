@@ -8,6 +8,8 @@
 # 保留 Makefile（区分大小写）
 !Makefile
 !.gitignore
+!*.sh
+!*.py
 
 # 如果有子目录，保留目录结构（必要）
 !*/

@@ -89,4 +89,6 @@ class Host {
     int connect_qp();
     int resources_destroy();
     std::thread thread_obj;
+public:
+    void join() { if (thread_obj.joinable()) thread_obj.join(); }
 };

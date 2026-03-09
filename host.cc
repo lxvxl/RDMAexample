@@ -589,7 +589,7 @@ void Host::run() {
             GOTO_ERR_IF_NONZERO(poll_completion(), host_run_exit);
             GOTO_ERR_IF_NONZERO(sock_sync_data(1, sync_str, temp_buf), host_run_exit);
             printf("[%d] successfully send data\n", config.tcp_port);
-            std::this_thread::sleep_for(std::chrono::milliseconds(std::rand() % 97));
+            std::this_thread::sleep_for(std::chrono::milliseconds(10000));
         } else {
             //GOTO_ERR_IF_NONZERO(post_receive(), host_run_exit);
             GOTO_ERR_IF_NONZERO(sock_sync_data(1, sync_str, temp_buf), host_run_exit);
@@ -606,7 +606,7 @@ host_run_exit:
 
 void Host::run_in_thread() {
     thread_obj = std::thread(&Host::run, this);
-    thread_obj.detach();
+    // 不 detach，由调用方通过 join() 等待
 }
 
 Host::~Host() {
