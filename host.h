@@ -16,7 +16,8 @@
 #include <thread>
 class Host {
    public:
-    Host(int gid_idx, int tcp_port, const char *servername, const char *dev_name, bool isSender);
+    Host(int gid_idx, int tcp_port, const char *servername, const char *dev_name,
+         bool isSender, int num_flows = 1, int dwell_ms = 2000);
     ~Host();
     int init();
     void run();
@@ -75,6 +76,8 @@ class Host {
     struct resource_t res;
     struct config_t config;
     bool isSender;
+    int num_flows;   /* 每个 QP 发送的 WR 数量 */
+    int dwell_ms;    /* 发送完成后 QP 保持存活的时长 (ms) */
 
     //return sock
     int sock_connect();

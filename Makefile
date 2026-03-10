@@ -44,24 +44,25 @@ build/%.o: %.cc | build
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # 运行选项（可通过 make 命令行覆盖）
-# 示例: make run N=2 F=3
-N  ?= 1   # 模拟的 Host 数量
-F  ?= 1   # 每个 Host 的流数量
+# 示例: make run N=2 F=3 W=5000
+N  ?= 1     # Host 数量 (= QP 数量)
+F  ?= 1     # 每个 QP 的 WR 数量
+W  ?= 2000  # QP 完成后保持存活时长 (ms)
 
 # 运行目标：构建并运行
 run: all
 	@if ifconfig | grep -q "192.168.5.122"; then \
-		./$(TARGET) -n $(N) -f $(F) 192.168.5.123; \
+		./$(TARGET) -n $(N) -f $(F) -w $(W) 192.168.5.123; \
 	else \
-		./NotifyReceive.sh N=$(N) F=$(F) > output.txt 2>&1 & \
-		./$(TARGET) -n $(N) -f $(F); \
+		./NotifyReceive.sh N=$(N) F=$(F) W=$(W) > output.txt 2>&1 & \
+		./$(TARGET) -n $(N) -f $(F) -w $(W); \
 	fi
 
 lrun: all
 	@if ifconfig | grep -q "192.168.5.122"; then \
-		ltrace -f -S -tt -o ltrace.log ./$(TARGET) -n $(N) -f $(F) 192.168.5.123; \
+		ltrace -f -S -tt -o ltrace.log ./$(TARGET) -n $(N) -f $(F) -w $(W) 192.168.5.123; \
 	else \
-		ltrace -f -S -tt -o ltrace.log ./$(TARGET) -n $(N) -f $(F); \
+		ltrace -f -S -tt -o ltrace.log ./$(TARGET) -n $(N) -f $(F) -w $(W); \
 	fi
 
 capture:

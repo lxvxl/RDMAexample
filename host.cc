@@ -72,7 +72,8 @@ static inline uint64_t ntohll(uint64_t x)
 
 char sync_str[] = "S";
 
-Host::Host(int gid_idx, int tcp_port, const char *servername, const char *dev_name, bool isSender) {
+Host::Host(int gid_idx, int tcp_port, const char *servername, const char *dev_name,
+           bool isSender, int num_flows, int dwell_ms) {
     config.gid_idx = gid_idx;
     config.tcp_port = tcp_port;
     config.server_name = servername;
@@ -80,6 +81,8 @@ Host::Host(int gid_idx, int tcp_port, const char *servername, const char *dev_na
     config.ib_port = 1;
     config.udp_sport = 0;
     this->isSender = isSender;
+    this->num_flows = num_flows;
+    this->dwell_ms  = dwell_ms;
     config.print();
 }
 
@@ -582,22 +585,26 @@ init_error:
 void Host::run() {
     char temp_buf[10];
     GOTO_ERR_IF_NONZERO(init(), host_run_exit);
-    printf("[%d]Successfully established RDMA connection! This is %s\n", config.tcp_port, isSender ? "Sender" : "Receiver");
-    while (true) {
+    printf("[%d]Successfully established RDMA connection! This is %s\n",
+           config.tcp_port, isSender ? "Sender" : "Receiver");
+
+    for (int i = 0; i < num_flows; i++) {
         if (isSender) {
             GOTO_ERR_IF_NONZERO(post_send(IBV_WR_RDMA_WRITE), host_run_exit);
             GOTO_ERR_IF_NONZERO(poll_completion(), host_run_exit);
             GOTO_ERR_IF_NONZERO(sock_sync_data(1, sync_str, temp_buf), host_run_exit);
-            printf("[%d] successfully send data\n", config.tcp_port);
-            std::this_thread::sleep_for(std::chrono::milliseconds(10000));
+            printf("[%d] flow %d/%d: sent\n", config.tcp_port, i + 1, num_flows);
         } else {
-            //GOTO_ERR_IF_NONZERO(post_receive(), host_run_exit);
             GOTO_ERR_IF_NONZERO(sock_sync_data(1, sync_str, temp_buf), host_run_exit);
-            //GOTO_ERR_IF_NONZERO(poll_completion(), host_run_exit);
-            printf("[%d] successfully receive data: %s\n", config.tcp_port, res.buf);
+            printf("[%d] flow %d/%d: received data: %s\n",
+                   config.tcp_port, i + 1, num_flows, res.buf);
         }
-        break; //暂时只发送一次
     }
+
+    printf("[%d] all %d flows done. Holding QP for %d ms ...\n",
+           config.tcp_port, num_flows, dwell_ms);
+    std::this_thread::sleep_for(std::chrono::milliseconds(dwell_ms));
+
     printf("[%d] successfully finish the task\n", config.tcp_port);
     return;
 host_run_exit:
