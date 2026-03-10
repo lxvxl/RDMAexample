@@ -599,6 +599,7 @@ void Host::run() {
             printf("[%d] flow %d/%d: received data: %s\n",
                    config.tcp_port, i + 1, num_flows, res.buf);
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     printf("[%d] all %d flows done. Holding QP for %d ms ...\n",
