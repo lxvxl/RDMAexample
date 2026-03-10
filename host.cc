@@ -244,7 +244,7 @@ int Host::post_send(int opcode) {
     }
 
     /* there is a Receive Request in the responder side, so we won't get any into RNR flow */
-    EXIT_IF_NONZERO(ibv_post_send(res.qp, &sr, &bad_wr));
+    EXIT_IF_NONZERO(my_post_send(res.qp, &sr, &bad_wr));
     //switch(opcode) {
     //case IBV_WR_SEND:
     //    fprintf(stdout, "Send Request was posted\n");

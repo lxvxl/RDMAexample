@@ -22,10 +22,9 @@ QP Lifecycle Daemon
 
 import argparse
 import ctypes
-import json
+import datetime
 import os
 import signal
-import subprocess
 import sys
 import time
 from collections import OrderedDict
@@ -34,11 +33,9 @@ from bcc import BPF
 # ──────────────────────────── 常量 ────────────────────────────
 
 LIBIBVERBS_PATH = "/lib/x86_64-linux-gnu/libibverbs.so"
-POLL_INTERVAL_MS = 100        # perf buffer 轮询间隔 (ms)
+POLL_INTERVAL_MS = 5          # perf buffer 轮询间隔 (ms) — 紧跟 5ms 字节采样节奏
 DEFAULT_REPORT_INTERVAL_S = 5 # 活跃 QP 汇总报告间隔 (s)
-DEFAULT_COUNTER_INTERVAL_S = 2 # counter 采样间隔 (s)
-DEFAULT_RDMA_DEVICE = "mlx5_0"
-DEFAULT_RDMA_PORT = 1
+DEFAULT_SIMULATOR_PATH = "/home/zhangj25/dcqcn-tuning/RDMAexample/Simulator"
 
 # 事件类型
 EVENT_QP_MODIFY  = 2
@@ -220,6 +217,75 @@ int trace_destroy_qp(struct pt_regs *ctx) {
     events.perf_submit(ctx, &ev, sizeof(ev));
     return 0;
 }
+
+/* ============================================================
+ * my_post_send uprobe — TX 字节统计
+ * ============================================================
+ * 函数签名 (post_send_hook.cc):
+ *   int my_post_send(struct ibv_qp *qp,
+ *                    struct ibv_send_wr *wr,
+ *                    struct ibv_send_wr **bad_wr)
+ *
+ * ibv_send_wr 字段布局 (根据 <infiniband/verbs.h> ABI):
+ *   offset  0: uint64_t wr_id
+ *   offset  8: void    *next      (链表下一个 WR)
+ *   offset 16: void    *sg_list   (scatter/gather 列表指针)
+ *   offset 24: int      num_sge   (SGE 数量)
+ *
+ * ibv_sge 字段布局 (16B 对齐):
+ *   offset  0: uint64_t addr
+ *   offset  8: uint32_t length
+ *   offset 12: uint32_t lkey
+ * ============================================================ */
+
+struct ibv_send_wr_stub {
+    uint64_t wr_id;    /* offset  0 */
+    void    *next;     /* offset  8 */
+    void    *sg_list;  /* offset 16 */
+    int      num_sge;  /* offset 24 */
+};
+
+struct ibv_sge_stub {
+    uint64_t addr;     /* offset  0 */
+    uint32_t length;   /* offset  8 */
+    uint32_t lkey;     /* offset 12 */
+};
+
+/* 累计 TX 字节数: qp_num → bytes */
+BPF_HASH(qp_tx_bytes, u32, u64, 4096);
+
+#define MY_MAX_SGE 8
+
+int trace_post_send(struct pt_regs *ctx) {
+    struct ibv_qp_stub      qp = {};
+    struct ibv_send_wr_stub wr = {};
+
+    bpf_probe_read_user(&qp, sizeof(qp), (void *)PT_REGS_PARM1(ctx));
+    bpf_probe_read_user(&wr, sizeof(wr), (void *)PT_REGS_PARM2(ctx));
+
+    u32 qp_num = qp.qp_num;
+    u64 bytes  = 0;
+    int nsge   = wr.num_sge;
+    if (nsge > MY_MAX_SGE) nsge = MY_MAX_SGE;
+
+    #pragma unroll
+    for (int i = 0; i < MY_MAX_SGE; i++) {
+        if (i >= nsge) break;
+        struct ibv_sge_stub sge = {};
+        /* 每个 ibv_sge 固定 16 字节 */
+        bpf_probe_read_user(&sge, sizeof(sge),
+                            (void *)((u64)wr.sg_list + (u64)i * 16ULL));
+        bytes += sge.length;
+    }
+
+    u64 *total = qp_tx_bytes.lookup(&qp_num);
+    if (total) {
+        __sync_fetch_and_add(total, bytes);
+    } else {
+        qp_tx_bytes.update(&qp_num, &bytes);
+    }
+    return 0;
+}
 """
 
 # ──────────────────────────── 用户态数据结构 ────────────────────────────
@@ -284,189 +350,29 @@ def _pid_alive(pid):
         return True       # 进程存在但我们没有权限, 算作存活
 
 
-# ──────────────────────────── Counter 管理器 ────────────────────────────
-
-class CounterManager:
-    """通过 iproute2 `rdma` CLI 管理 per-QP 计数器的绑定、解绑和读取。
-
-    方案:
-      1. 启动时开启 auto mode (`rdma statistic qp set ... auto type on`) —
-         后续新建的 QP 自动按类型分组获得计数器。
-      2. 对守护进程监测到的活跃 QP，尝试手动 bind —
-         确保即使 auto mode 未及时绑定也能采集。
-      3. 定期通过 `rdma -j statistic qp show` 读取 per-QP 计数器。
-      4. QP 销毁时执行 unbind 清理。
-    """
-
-    def __init__(self, device=DEFAULT_RDMA_DEVICE, port=DEFAULT_RDMA_PORT):
-        self.device = device
-        self.port = port
-        self.link = f"{device}/{port}"
-        # qp_num → counter_id (from bind responses)
-        self.bound_counters = {}   # qp_num → cntn_id | None
-        # 上一次采样快照: qp_num → {counter_name: value}
-        self.prev_qp_stats = {}
-        # 上一次端口级快照
-        self.prev_port_stats = {}
-
-    # ── 初始化: 开启 auto mode ──
-
-    def enable_auto_mode(self):
-        """开启 auto type mode，使新建 QP 自动获得 counter。"""
-        cmd = ["rdma", "statistic", "qp", "set", "link", self.link,
-               "auto", "type", "on"]
-        try:
-            subprocess.run(cmd, capture_output=True, timeout=5)
-        except Exception as e:
-            print(f"[Counter] WARNING: failed to enable auto mode: {e}")
-
-    def disable_auto_mode(self):
-        """关闭 auto type mode（清理用）。"""
-        cmd = ["rdma", "statistic", "qp", "set", "link", self.link,
-               "auto", "off"]
-        try:
-            subprocess.run(cmd, capture_output=True, timeout=5)
-        except Exception:
-            pass
-
-    # ── 绑定 / 解绑 ──
-
-    def bind_qp(self, qp_num):
-        """为指定 QP 手动绑定一个计数器。"""
-        if qp_num in self.bound_counters:
-            return  # 已绑定
-        cmd = ["rdma", "statistic", "qp", "bind", "link", self.link,
-               "lqpn", str(qp_num)]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                self.bound_counters[qp_num] = None  # counter_id 未知，稍后从 show 中获取
-            # 如果失败（例如 auto mode 已经绑定了），静默忽略
-        except Exception:
-            pass
-
-    def unbind_qp(self, qp_num):
-        """解绑指定 QP 的计数器。"""
-        cntn_id = self.bound_counters.pop(qp_num, None)
-        self.prev_qp_stats.pop(qp_num, None)
-        # 注: QP 销毁后，内核会自动清理绑定，unbind 可能已经隐式完成
-        # 但手动 unbind 也是安全的
-        if cntn_id is not None:
-            cmd = ["rdma", "statistic", "qp", "unbind", "link", self.link,
-                   "cntn", str(cntn_id), "lqpn", str(qp_num)]
-            try:
-                subprocess.run(cmd, capture_output=True, timeout=5)
-            except Exception:
-                pass
-
-    # ── 读取计数器 ──
-
-    def read_qp_stats(self):
-        """读取 per-QP 计数器 (JSON)。
-        返回: dict[qp_num → dict[counter_name → value]]
-        """
-        cmd = ["rdma", "-j", "-p", "statistic", "qp", "show", "link", self.link]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-            if result.returncode != 0 or not result.stdout.strip():
-                return {}
-            data = json.loads(result.stdout)
-        except Exception:
-            return {}
-
-        # data 格式示例:
-        # [{"ifname": "mlx5_0", "port": 1, "cntn": 0,
-        #   "lqpn": [178, 200],
-        #   "rx_write_requests": 1234, ...}]
-        qp_stats = {}
-        for entry in data:
-            counters = {k: v for k, v in entry.items()
-                        if k not in ("ifname", "port", "cntn", "lqpn")}
-            cntn_id = entry.get("cntn")
-            lqpns = entry.get("lqpn", [])
-            if isinstance(lqpns, int):
-                lqpns = [lqpns]
-            for qpn in lqpns:
-                qp_stats[qpn] = counters
-                # 记录 counter_id 映射
-                if cntn_id is not None:
-                    self.bound_counters[qpn] = cntn_id
-        return qp_stats
-
-    def read_port_stats(self):
-        """读取端口级计数器 (JSON)。返回 dict[counter_name → value]。"""
-        cmd = ["rdma", "-j", "-p", "statistic", "show", "link", self.link]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-            if result.returncode != 0 or not result.stdout.strip():
-                return {}
-            data = json.loads(result.stdout)
-        except Exception:
-            return {}
-
-        if data and isinstance(data, list):
-            entry = data[0]
-            return {k: v for k, v in entry.items()
-                    if k not in ("ifname", "port")}
-        return {}
-
-    def compute_deltas(self, current, previous):
-        """计算两次采样之间的差值 (delta)。"""
-        deltas = {}
-        for key, val in current.items():
-            if isinstance(val, (int, float)):
-                prev_val = previous.get(key, 0)
-                deltas[key] = val - prev_val
-        return deltas
-
-    def sample_and_diff(self):
-        """执行一次完整采样，返回 per-QP deltas 和 port deltas。
-
-        Returns:
-            qp_deltas:   dict[qp_num → dict[counter_name → delta_value]]
-            port_deltas: dict[counter_name → delta_value]
-        """
-        # Per-QP
-        cur_qp = self.read_qp_stats()
-        qp_deltas = {}
-        for qpn, stats in cur_qp.items():
-            prev = self.prev_qp_stats.get(qpn, {})
-            delta = self.compute_deltas(stats, prev)
-            if any(v != 0 for v in delta.values()):
-                qp_deltas[qpn] = delta
-        self.prev_qp_stats = cur_qp
-
-        # Port-level
-        cur_port = self.read_port_stats()
-        port_deltas = self.compute_deltas(cur_port, self.prev_port_stats)
-        self.prev_port_stats = cur_port
-
-        return qp_deltas, port_deltas
-
 
 # ──────────────────────────── 守护进程主类 ────────────────────────────
 
 class QPDaemon:
+    BYTE_INTERVAL = 0.005   # 5ms — TX 字节采样间隔
+
     def __init__(self, report_interval=DEFAULT_REPORT_INTERVAL_S,
-                 counter_interval=DEFAULT_COUNTER_INTERVAL_S,
-                 device=DEFAULT_RDMA_DEVICE, port=DEFAULT_RDMA_PORT,
-                 quiet=False):
-        self.active_qps       = OrderedDict()  # qp_num → QPRecord
+                 simulator_path=None, quiet=False):
+        self.active_qps       = OrderedDict()   # qp_num → QPRecord
         self.running          = True
-        self.last_report_time  = time.monotonic()
-        self.last_counter_time = time.monotonic()
+        self.last_report_time = time.monotonic()
+        self.last_byte_time   = time.monotonic()
         self.report_interval  = report_interval
-        self.counter_interval = counter_interval
+        self.simulator_path   = simulator_path
         self.quiet            = quiet
         self.event_count      = 0
-        self.counter_mgr      = CounterManager(device=device, port=port)
+        self._tx_bytes_prev   = {}              # qp_num → 上次采样的累计字节数
 
     # ── 事件分发 ──
 
     def handle_event(self, cpu, data, size):
         event = ctypes.cast(data, ctypes.POINTER(QPEvent)).contents
         self.event_count += 1
-
         if event.event_type == EVENT_QP_MODIFY:
             self._on_modify(event)
         elif event.event_type == EVENT_QP_DESTROY:
@@ -481,24 +387,17 @@ class QPDaemon:
         if is_new:
             rec = QPRecord(ev.qp_num, ev.pid, ev.timestamp_ns)
             self.active_qps[ev.qp_num] = rec
-            # 新 QP 出现, 尝试绑定 counter
-            self.counter_mgr.bind_qp(ev.qp_num)
 
         rec.last_modified_ns = ev.timestamp_ns
 
-        # 更新状态
         if ev.qp_state != NO_STATE_CHANGE:
-            state_name = QP_STATE_NAMES.get(ev.qp_state, f"?({ev.qp_state})")
-            rec.state = state_name
-
-        # 更新对端信息
+            rec.state = QP_STATE_NAMES.get(ev.qp_state, f"?({ev.qp_state})")
         if ev.dest_qp_num:
             rec.dest_qp_num = ev.dest_qp_num
         if ev.dest_ip:
             rec.dest_ip = ev.dest_ip
 
         if not self.quiet:
-            # 首次 MODIFY→INIT 额外标注为隐式创建
             tag = "NEW+MOD" if is_new else "MODIFY"
             dest_info = ""
             if ev.dest_ip:
@@ -507,17 +406,13 @@ class QPDaemon:
                     f"  dest_qpn={ev.dest_qp_num}"
                 )
             state_str = rec.state if ev.qp_state != NO_STATE_CHANGE else "(no change)"
-            print(
-                f"  [{tag:7s}] QP {ev.qp_num:<8} → {state_str}"
-                f"{dest_info}  pid={ev.pid}"
-            )
+            print(f"  [{tag:7s}] QP {ev.qp_num:<8} → {state_str}{dest_info}  pid={ev.pid}")
 
     # ── DESTROY ──
 
     def _on_destroy(self, ev):
         rec = self.active_qps.pop(ev.qp_num, None)
-        # 清理 counter 绑定
-        self.counter_mgr.unbind_qp(ev.qp_num)
+        self._tx_bytes_prev.pop(ev.qp_num, None)
         if not self.quiet:
             tracked = "tracked" if rec else "untracked"
             print(f"  [DESTROY] QP {ev.qp_num:<8}  pid={ev.pid}  ({tracked})")
@@ -525,25 +420,42 @@ class QPDaemon:
     # ── 进程退出检测：清理孤儿 QP ──
 
     def _reap_dead_pids(self):
-        """检查活跃 QP 对应的 PID 是否仍然存活；
-        若进程已退出（内核自动回收 QP），则从表中移除。
-        """
-        dead_qps = []
-        for qp_num, rec in self.active_qps.items():
-            if not _pid_alive(rec.pid):
-                dead_qps.append(qp_num)
-        for qp_num in dead_qps:
-            rec = self.active_qps.pop(qp_num)
-            self.counter_mgr.unbind_qp(qp_num)
+        dead = [qn for qn, r in self.active_qps.items() if not _pid_alive(r.pid)]
+        for qn in dead:
+            rec = self.active_qps.pop(qn)
+            self._tx_bytes_prev.pop(qn, None)
             if not self.quiet:
-                print(f"  [REAPED]  QP {qp_num:<8}  pid={rec.pid} (process exited)")
+                print(f"  [REAPED]  QP {qn:<8}  pid={rec.pid} (process exited)")
+
+    # ── 每 5ms 采样 TX 字节数（直接读 BPF map，无子进程，延迟 <1ms） ──
+
+    def _sample_tx_bytes(self, bpf_obj):
+        """读取 qp_tx_bytes BPF map，输出字节增量非零的 QP。"""
+        lines = []
+        for k, v in bpf_obj["qp_tx_bytes"].items():
+            qpn = k.value
+            cur = v.value
+            prev = self._tx_bytes_prev.get(qpn)
+            if prev is None:
+                # 首次见到该 QP：建立基准，本轮不输出
+                self._tx_bytes_prev[qpn] = cur
+                continue
+            delta = cur - prev
+            if delta > 0:
+                self._tx_bytes_prev[qpn] = cur
+                rate_mbps = (delta * 8) / (self.BYTE_INTERVAL * 1e6)
+                lines.append(f"  QP {qpn:<6}  +{delta:>10} B   {rate_mbps:>8.2f} Mb/s")
+
+        if lines:
+            ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            print(f"[{ts}]")
+            for line in lines:
+                print(line)
 
     # ── 定期汇总 ──
 
     def print_active_qps(self):
-        # 先清理已退出进程的 QP
         self._reap_dead_pids()
-
         print(f"\n{'='*72}")
         print(f"  Active QPs: {len(self.active_qps)}    "
               f"(total events processed: {self.event_count})")
@@ -554,34 +466,6 @@ class QPDaemon:
             for _, rec in self.active_qps.items():
                 print(f"    {rec}")
         print(f"{'='*72}\n")
-
-    # ── Counter 采样与打印 ──
-
-    def _sample_counters(self):
-        """采样 per-QP 与端口级 counter，打印非零 delta。"""
-        qp_deltas, port_deltas = self.counter_mgr.sample_and_diff()
-
-        # 过滤只显示非零 delta 的字段
-        non_zero_port = {k: v for k, v in port_deltas.items() if v != 0}
-
-        if not qp_deltas and not non_zero_port:
-            return  # 没有变化, 不打印
-
-        print(f"  --- Counter deltas (interval={self.counter_interval}s) ---")
-
-        if non_zero_port:
-            print(f"  [PORT {self.counter_mgr.link}]")
-            for k, v in non_zero_port.items():
-                print(f"    {k}: +{v}")
-
-        for qpn, deltas in qp_deltas.items():
-            non_zero = {k: v for k, v in deltas.items() if v != 0}
-            if non_zero:
-                print(f"  [QP {qpn}]")
-                for k, v in non_zero.items():
-                    print(f"    {k}: +{v}")
-
-        print()
 
     # ── 主循环 ──
 
@@ -601,21 +485,24 @@ class QPDaemon:
             fn_name="trace_destroy_qp",
         )
 
+        if self.simulator_path and os.path.isfile(self.simulator_path):
+            b.attach_uprobe(
+                name=self.simulator_path,
+                sym="my_post_send",
+                fn_name="trace_post_send",
+            )
+            print(f"  • my_post_send    (uprobe → {self.simulator_path})")
+        else:
+            print("  ! TX byte counting disabled "
+                  "(use -s <path> to specify Simulator binary)")
+
         b["events"].open_perf_buffer(self.handle_event, page_cnt=64)
 
-        # ---- 初始化 Counter 管理 ----
-        self.counter_mgr.enable_auto_mode()
-        # 做一次初始采样，建立 baseline（后续计算 delta）
-        self.counter_mgr.sample_and_diff()
-
-        print("[QPDaemon] Tracing libibverbs functions:")
+        print("[QPDaemon] Tracing:")
         print("  • ibv_modify_qp   (uprobe) — first INIT = implicit creation")
         print("  • ibv_destroy_qp  (uprobe)")
-        print(f"[QPDaemon] RDMA device: {self.counter_mgr.link}")
-        print(f"[QPDaemon] Counter auto mode: enabled")
-        print(f"[QPDaemon] Report interval: {self.report_interval}s")
-        print(f"[QPDaemon] Counter sample interval: {self.counter_interval}s")
-        print(f"[QPDaemon] Stale QP reaping: enabled (PID liveness check)")
+        print(f"[QPDaemon] TX byte sample interval : {self.BYTE_INTERVAL*1000:.0f} ms")
+        print(f"[QPDaemon] Active QP report interval: {self.report_interval} s")
         print("[QPDaemon] Press Ctrl+C to exit\n")
 
         while self.running:
@@ -626,17 +513,16 @@ class QPDaemon:
 
             now = time.monotonic()
 
-            # 定期采样 counter
-            if now - self.last_counter_time >= self.counter_interval:
-                self._sample_counters()
-                self.last_counter_time = now
+            # 每 5ms 采样 TX 字节数（直接读 BPF map，无子进程）
+            if now - self.last_byte_time >= self.BYTE_INTERVAL:
+                self._sample_tx_bytes(b)
+                self.last_byte_time = now
 
             # 定期打印活跃 QP 汇总
             if now - self.last_report_time >= self.report_interval:
                 self.print_active_qps()
                 self.last_report_time = now
 
-        # 退出前打印最终状态
         print("\n[QPDaemon] Shutting down ...")
         self.print_active_qps()
 
@@ -644,38 +530,29 @@ class QPDaemon:
 # ──────────────────────────── CLI 入口 ────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="QP Lifecycle Daemon")
+    parser = argparse.ArgumentParser(
+        description="QP Lifecycle Daemon — eBPF 监测 RDMA QP 生命周期与 TX 字节数"
+    )
     parser.add_argument(
         "-i", "--interval", type=float, default=DEFAULT_REPORT_INTERVAL_S,
         help=f"活跃 QP 汇总报告间隔 (秒), 默认 {DEFAULT_REPORT_INTERVAL_S}",
     )
     parser.add_argument(
-        "-c", "--counter-interval", type=float, default=DEFAULT_COUNTER_INTERVAL_S,
-        help=f"counter 采样间隔 (秒), 默认 {DEFAULT_COUNTER_INTERVAL_S}",
-    )
-    parser.add_argument(
-        "-d", "--device", type=str, default=DEFAULT_RDMA_DEVICE,
-        help=f"RDMA 设备名, 默认 {DEFAULT_RDMA_DEVICE}",
-    )
-    parser.add_argument(
-        "-p", "--port", type=int, default=DEFAULT_RDMA_PORT,
-        help=f"RDMA 端口号, 默认 {DEFAULT_RDMA_PORT}",
+        "-s", "--simulator", type=str, default=DEFAULT_SIMULATOR_PATH,
+        help="Simulator 二进制绝对路径，用于 my_post_send uprobe，默认 %(default)s",
     )
     parser.add_argument(
         "-q", "--quiet", action="store_true",
-        help="静默模式: 不打印单条事件, 仅打印周期汇总",
+        help="静默模式: 不打印单条生命周期事件，仅打印周期 TX 字节与汇总",
     )
     args = parser.parse_args()
 
     daemon = QPDaemon(
         report_interval=args.interval,
-        counter_interval=args.counter_interval,
-        device=args.device,
-        port=args.port,
+        simulator_path=args.simulator,
         quiet=args.quiet,
     )
 
-    # 信号处理: 优雅退出
     def sig_handler(signum, frame):
         daemon.running = False
 

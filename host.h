@@ -14,6 +14,16 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <thread>
+
+/* 声明非内联 post_send 包装 (定义在 post_send_hook.cc)，供 qp_daemon eBPF uprobe 挂载 */
+#ifdef __cplusplus
+extern "C" {
+#endif
+int my_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr **bad_wr);
+#ifdef __cplusplus
+}
+#endif
+
 class Host {
    public:
     Host(int gid_idx, int tcp_port, const char *servername, const char *dev_name,
